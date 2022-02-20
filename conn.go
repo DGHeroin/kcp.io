@@ -15,9 +15,4 @@ type Conn interface {
     SetContext(v interface{})
 
     Emit(msg string, payload []byte)
-
-    //Join(room string)
-    //Leave(room string)
-    //LeaveAll()
-    //Rooms() []string
 }

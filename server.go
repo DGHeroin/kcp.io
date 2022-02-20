@@ -5,6 +5,7 @@ import (
     "github.com/xtaci/kcp-go/v5"
     "io"
     "net"
+    "sync/atomic"
     "time"
 )
 
@@ -19,19 +20,22 @@ type (
         rChan        chan *iEventMsg
         wChan        chan *iEventMsg
         writeTimeout time.Duration
+        clientId     int64
     }
     ServerOption struct {
-        BufferQueue  uint
-        ReadTimeout  time.Duration
-        WriteTimeout time.Duration
+        RecvBufferQueue uint
+        SendBufferQueue uint
+        ReadTimeout     time.Duration
+        WriteTimeout    time.Duration
     }
 )
 
 var (
     DefaultServerOption = &ServerOption{
-        BufferQueue:  0,
-        ReadTimeout:  30 * time.Second,
-        WriteTimeout: 30 * time.Second,
+        RecvBufferQueue: 0,
+        SendBufferQueue: 0,
+        ReadTimeout:     30 * time.Second,
+        WriteTimeout:    30 * time.Second,
     }
 )
 
@@ -40,8 +44,8 @@ func NewServer(opt *ServerOption) *Server {
         opt = DefaultServerOption
     }
     return &Server{
-        rChan: make(chan *iEventMsg, opt.BufferQueue),
-        wChan: make(chan *iEventMsg, opt.BufferQueue),
+        rChan: make(chan *iEventMsg, opt.RecvBufferQueue),
+        wChan: make(chan *iEventMsg, opt.SendBufferQueue),
     }
 }
 func (s *Server) Serve(addrs ...string) {
@@ -58,7 +62,8 @@ func (s *Server) Serve(addrs ...string) {
     s.handleAccept(ln)
 }
 func (s *Server) serveConn(conn net.Conn) {
-    var cli = &client{
+    var cli = &remoteClient{
+        id:       atomic.AddInt64(&s.clientId, 1),
         sendChan: s.wChan,
     }
     if err := s.onConnect(cli); err != nil {
@@ -68,6 +73,7 @@ func (s *Server) serveConn(conn net.Conn) {
     for {
         payload, err := readHeadMessage(conn, time.Second*10)
         if err != nil {
+            s.onError(cli, err)
             break
         }
         evt := askEventMsg()
@@ -84,16 +90,15 @@ func (s *Server) OnConnect(cb func(conn Conn) error) {
 func (s *Server) OnDisconnect(cb func(Conn)) {
     s.onDisconnect = cb
 }
-
 func (s *Server) OnError(cb func(Conn, error)) {
     s.onError = cb
 }
-func (s *Server) OnEvent(cb func(Conn, []byte)) {
+func (s *Server) OnEvent(cb func(conn Conn, payload[]byte)) {
     s.onEvent = cb
 }
 
 func (s *Server) handleRead() {
-    pOnEvent := func(cli *client, payload []byte) {
+    pOnEvent := func(cli *remoteClient, payload []byte) {
         defer func() {
             recover()
         }()
@@ -112,7 +117,7 @@ func (s *Server) handleRead() {
 }
 
 func (s *Server) handleWrite() {
-    pOnEvent := func(cli *client, payload []byte) {
+    pOnEvent := func(cli *remoteClient, payload []byte) {
         defer func() {
             recover()
         }()

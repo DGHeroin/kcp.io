@@ -4,19 +4,15 @@ import "sync"
 
 type (
     iEventMsg struct {
-        conn    *client
+        conn    *remoteClient
         payload []byte
-    }
-    iErrMsg struct {
-        conn Conn
-        err  error
     }
 )
 
 var (
     iEventMsgPool = sync.Pool{
         New: func() interface{} {
-            return iEventMsg{}
+            return &iEventMsg{}
         },
     }
 )
