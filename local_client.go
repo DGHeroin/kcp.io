@@ -39,13 +39,11 @@ func (s *Client) OnError(cb func(error)) {
 func (s *Client) OnEvent(cb func([]byte)) {
     s.onEvent = cb
 }
-
 func (s *Client) Connect(raddr string) error {
     conn, err := kcp.Dial(raddr)
     if err != nil {
         return err
     }
     s.conn = conn
-    writeHeadMessage(conn, []byte("hello"), 0)
     return nil
 }

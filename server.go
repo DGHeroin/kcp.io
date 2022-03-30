@@ -1,9 +1,9 @@
 package kio
 
 import (
-    "encoding/binary"
+    "encoding/json"
     "github.com/xtaci/kcp-go/v5"
-    "io"
+    "log"
     "net"
     "sync/atomic"
     "time"
@@ -11,16 +11,20 @@ import (
 
 type (
     Server struct {
-        onConnect    func(conn Conn) error
-        onDisconnect func(conn Conn)
-        onError      func(conn Conn, err error)
-        onEvent      func(Conn, []byte)
-        opt          *ServerOption
-        ln           net.Listener
-        rChan        chan *iEventMsg
-        wChan        chan *iEventMsg
-        writeTimeout time.Duration
-        clientId     int64
+        onConnect      func(conn Conn) error
+        onDisconnect   func(conn Conn)
+        onError        func(conn Conn, err error)
+        onEvent        func(Conn, []byte)
+        opt            *ServerOption
+        ln             net.Listener
+        rChan          chan *iEventMsg
+        wChan          chan *iEventMsg
+        writeTimeout   time.Duration
+        clientId       int64
+        remoteClients  map[int64]*remoteClient
+        clientCount    int64
+        sendBytesCount uint64
+        recvBytesCount uint64
     }
     ServerOption struct {
         RecvBufferQueue uint
@@ -30,18 +34,17 @@ type (
     }
 )
 
-var (
-    DefaultServerOption = &ServerOption{
+func DefaultServerOption() *ServerOption {
+    return &ServerOption{
         RecvBufferQueue: 0,
         SendBufferQueue: 0,
         ReadTimeout:     30 * time.Second,
         WriteTimeout:    30 * time.Second,
     }
-)
-
+}
 func NewServer(opt *ServerOption) *Server {
     if opt == nil {
-        opt = DefaultServerOption
+        opt = DefaultServerOption()
     }
     return &Server{
         rChan: make(chan *iEventMsg, opt.RecvBufferQueue),
@@ -66,24 +69,34 @@ func (s *Server) serveConn(conn net.Conn) {
         id:       atomic.AddInt64(&s.clientId, 1),
         sendChan: s.wChan,
     }
+    atomic.AddInt64(&s.clientCount, 1)
     if err := s.onConnect(cli); err != nil {
         return
     }
 
     for {
-        payload, err := readHeadMessage(conn, time.Second*10)
+        payload, err := readHeadMessage(conn, time.Second*10, &s.recvBytesCount)
         if err != nil {
             s.onError(cli, err)
             break
         }
+        var pkt packet
+        if err := json.Unmarshal(payload, &pkt); err != nil {
+            s.onError(cli, ErrorMessageCorrupt)
+            cli.Close()
+            break
+        }
         evt := askEventMsg()
         evt.conn = cli
-        evt.payload = payload
+        evt.payload = &packet{
+            Type:    0,
+            Payload: nil,
+        }
         s.rChan <- evt
     }
     s.onDisconnect(cli)
+    atomic.AddInt64(&s.clientCount, -1)
 }
-
 func (s *Server) OnConnect(cb func(conn Conn) error) {
     s.onConnect = cb
 }
@@ -93,16 +106,35 @@ func (s *Server) OnDisconnect(cb func(Conn)) {
 func (s *Server) OnError(cb func(Conn, error)) {
     s.onError = cb
 }
-func (s *Server) OnEvent(cb func(conn Conn, payload[]byte)) {
+func (s *Server) OnEvent(cb func(conn Conn, payload []byte)) {
     s.onEvent = cb
 }
-
+func (s *Server) Count() int64 {
+    return atomic.LoadInt64(&s.clientCount)
+}
 func (s *Server) handleRead() {
-    pOnEvent := func(cli *remoteClient, payload []byte) {
+    pOnEvent := func(cli *remoteClient, msg *iEventMsg) {
         defer func() {
             recover()
         }()
-        s.onEvent(cli, payload)
+        p := msg.payload
+        switch p.Type {
+        case 0: // ping
+            msg := askEventMsg()
+            msg.payload = &packet{
+                Id:      cli.NextId(),
+                Type:    0,
+                Payload: nil,
+            }
+            cli.sendChan <- msg
+        case 1: // pong
+            return
+        case 2: // req
+            s.onEvent(cli, p.Payload)
+        case 3: // rsp
+        }
+        log.Println(p)
+
     }
     go func() {
         for {
@@ -110,22 +142,24 @@ func (s *Server) handleRead() {
             if e == nil {
                 break
             }
-            pOnEvent(e.conn, e.payload)
+            atomic.AddUint64(&s.recvBytesCount, e.size)
+            pOnEvent(e.conn, e)
             relEventMsg(e)
         }
     }()
 }
-
 func (s *Server) handleWrite() {
-    pOnEvent := func(cli *remoteClient, payload []byte) {
+    pOnEvent := func(cli *remoteClient, msg *iEventMsg) {
         defer func() {
             recover()
         }()
-        _, err := writeHeadMessage(cli.conn, payload, s.writeTimeout)
+        var bin []byte
+        n, err := writeHeadMessage(cli.conn, bin, s.writeTimeout, &s.sendBytesCount)
         if err != nil {
             s.onError(cli, err)
             return
         }
+        atomic.AddUint64(&s.sendBytesCount, uint64(n))
     }
     go func() {
         for {
@@ -133,12 +167,11 @@ func (s *Server) handleWrite() {
             if e == nil {
                 break
             }
-            pOnEvent(e.conn, e.payload)
+            pOnEvent(e.conn, e)
             relEventMsg(e)
         }
     }()
 }
-
 func (s *Server) handleAccept(ln net.Listener) {
     for {
         conn, err := ln.Accept()
@@ -146,52 +179,4 @@ func (s *Server) handleAccept(ln net.Listener) {
             s.serveConn(conn)
         }
     }
-}
-
-func readHeadMessage(conn net.Conn, timeout time.Duration) ([]byte, error) {
-    var header = make([]byte, 4)
-    if timeout > 0 {
-        if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-            return nil, err
-        }
-    }
-    if n, err := io.ReadFull(conn, header); n != 4 || err != nil {
-        return nil, err
-    }
-    sz := binary.BigEndian.Uint32(header)
-    if sz > cMessagePayloadSize {
-        return nil, ErrorMessageTooLarge
-    }
-    payload := make([]byte, sz)
-    if timeout > 0 {
-        if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-            return nil, err
-        }
-    }
-    if _, err := io.ReadFull(conn, payload); err != nil {
-        return nil, err
-    }
-    return payload, nil
-}
-func writeHeadMessage(conn net.Conn, payload []byte, timeout time.Duration) (int, error) {
-    sz := uint32(len(payload))
-
-    if sz > cMessagePayloadSize {
-        return 0, ErrorMessageTooLarge
-    }
-
-    var header = make([]byte, 4)
-    binary.BigEndian.PutUint32(header, sz)
-
-    if timeout > 0 {
-        if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-            return -0, err
-        }
-    }
-    if sz == 0 {
-        return conn.Write(header)
-    } else {
-        return conn.Write(append(header, payload...))
-    }
-
 }

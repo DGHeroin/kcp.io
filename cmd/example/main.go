@@ -35,6 +35,7 @@ func runClient() {
 
 func runServer() {
     s := kio.NewServer(nil)
+
     s.OnConnect(func(conn kio.Conn) error {
         log.Println("接受客户端:", conn)
         return nil
@@ -46,8 +47,7 @@ func runServer() {
         log.Println("发生错误:", conn, err)
     })
     s.OnEvent(func(conn kio.Conn, payload []byte) {
-        log.Println("收到:", conn, payload)
+        log.Println("收到:", conn, string(payload))
     })
-
     s.Serve()
 }

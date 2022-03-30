@@ -5,7 +5,8 @@ import "sync"
 type (
     iEventMsg struct {
         conn    *remoteClient
-        payload []byte
+        payload *packet
+        size    uint64
     }
 )
 

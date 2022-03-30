@@ -3,6 +3,7 @@ package kio
 import (
     "net"
     "strconv"
+    "sync/atomic"
 )
 
 type (
@@ -11,6 +12,7 @@ type (
         id       int64
         ctx      interface{}
         sendChan chan *iEventMsg
+        msgId    int32
     }
 )
 
@@ -41,6 +43,13 @@ func (c *remoteClient) SetContext(v interface{}) {
 func (c *remoteClient) Emit(msg string, payload []byte) {
     e := askEventMsg()
     e.conn = c
-    e.payload = payload
+    e.payload = &packet{
+        Type:    pTypeRequest,
+        Payload: payload,
+    }
     c.sendChan <- e
+}
+
+func (c *remoteClient) NextId() int {
+    return int(atomic.AddInt32(&c.msgId, 1))
 }
